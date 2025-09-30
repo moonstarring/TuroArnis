@@ -8,57 +8,59 @@ from PIL import Image, ImageTk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import queue
+import numpy as np
 
-
+# import our modular components
 from gui.results_window import ResultsWindow
 from computer_vision.pose_analyzer import PoseAnalyzer
+from pose_definitions import POSE_LIBRARY
 
 class TuroArnisGUI:
     def __init__(self, window, window_title):
         self.window = window
         self.window.title(window_title)
         
-        # initialize our new pose analyzer class
-        self.analyzer = PoseAnalyzer()
+        # force a 16:9 window
+        self.window_width = 1920
+        self.window_height = 1080
+        self.window.geometry(f"{self.window_width}x{self.window_height}")
 
-        # Set desired height and calculate width based on 16:9 aspect ratio
-        target_height = 1920
-        aspect_ratio = 16/9
-        target_width = int(target_height * aspect_ratio)
-
-        self.cap = cv2.VideoCapture(0)
-        # Set camera resolution
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
-        
-        # Get actual supported resolution (might be different from requested)
-        self.cam_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.cam_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Set window size
-        self.window.geometry(f"{self.cam_width}x{self.cam_height}")
-
-        # Center the window on screen
+        # center the window on screen
         screen_width = self.window.winfo_screenwidth()
         screen_height = self.window.winfo_screenheight()
-        x = (screen_width - self.cam_width) // 2
-        y = (screen_height - self.cam_height) // 2
+        x = (screen_width - self.window_width) // 2
+        y = (screen_height - self.window_height) // 2
         self.window.geometry(f"+{x}+{y}")
 
+        # initialize our pose analyzer class
+        self.analyzer = PoseAnalyzer()
+
+        # video capture setup
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            print("[critical error] cannot open webcam.")
+            self.is_running = False
+            return
+        
         self.queue = queue.Queue(maxsize=1)
         self.target_form = None
         self.current_user = "Default User"
 
-        # --- create and place gui widgets (this part is largely the same) ---
+        # add variables for frame skipping
+        self.frame_counter = 0
+        self.processing_interval = 4 # process ai every 4 frames
+        self.last_known_results = []
+        self.last_known_tracked_persons = []
+
+        # create and place gui widgets
         self.video_label = ttk.Label(self.window)
         self.video_label.place(x=0, y=0, relwidth=1, relheight=1)
         
         self.controls_panel = ttk.Frame(self.window, padding=15, bootstyle="dark")
         self.controls_panel.place(x=20, y=20)
 
+        # widget creation
         ttk.Label(self.controls_panel, text="Controls", font=("-size 14 -weight bold"), bootstyle="inverse-dark").pack(pady=(0, 10), anchor=W)
-        
-        # user dropdown
         self.user_button = ttk.Menubutton(self.controls_panel, text=self.current_user, bootstyle="secondary")
         self.user_button.pack(fill=X, pady=5)
         self.user_menu = ttk.Menu(self.user_button)
@@ -66,15 +68,9 @@ class TuroArnisGUI:
         for user_text in users:
             self.user_menu.add_command(label=user_text, command=lambda u=user_text: self.on_user_selected(u))
         self.user_button["menu"] = self.user_menu
-
-        # form dropdown
         self.practice_stances = {
-            "Crown Thrust": "crown_thrust_correct", "Left Chest Thrust": "left_chest_thrust_correct",
-            "Left Elbow Block": "left_elbow_block_correct", "Left Eye Thrust": "left_eye_thrust_correct",
-            "Left Knee Block": "left_knee_block_correct", "Left Temple Block": "left_temple_block_correct",
-            "Right Chest Thrust": "right_chest_thrust_correct", "Right Elbow Block": "right_elbow_block_correct",
-            "Right Eye Thrust": "right_eye_thrust_correct", "Right Knee Block": "right_knee_block_correct",
-            "Right Temple Block": "right_temple_block_correct", "Solar Plexus Thrust": "solar_plexus_thrust_correct"
+            "Crown Thrust": "crown_thrust_correct",
+            "Left Temple Block": "left_temple_block_correct"
         }
         self.form_button = ttk.Menubutton(self.controls_panel, text="Choose Arnis Form", bootstyle="primary")
         self.form_button.pack(fill=X, pady=5)
@@ -82,12 +78,12 @@ class TuroArnisGUI:
         for pretty_name in self.practice_stances.keys():
             self.form_menu.add_command(label=pretty_name, command=lambda p=pretty_name: self.on_action_selected(p))
         self.form_button["menu"] = self.form_menu
-
-        # feedback labels (simplified as feedback is on-screen now)
         ttk.Separator(self.controls_panel, orient=HORIZONTAL).pack(fill=X, pady=15)
-        self.status_label = ttk.Label(self.controls_panel, text="Status: Select a form", font="-size 12", wraplength=220, bootstyle="inverse-dark")
+        
+        # --- this is the corrected line ---
+        self.status_label = ttk.Label(self.controls_panel, text="Status: Select a form", font=("-size 12"), wraplength=220, bootstyle="inverse-dark")
         self.status_label.pack(fill=X, pady=5, anchor=W)
-
+        
         self.view_all_results_button = ttk.Button(self.controls_panel, text="View All Results", command=self.open_results_window, bootstyle="info")
         self.view_all_results_button.pack(fill=X, pady=10, side=BOTTOM)
 
@@ -100,24 +96,96 @@ class TuroArnisGUI:
         self.process_queue()
         self.window.mainloop()
 
+    '''def resize_and_pad(self, img, size, pad_color=0):
+        h, w = img.shape[:2]
+        sw, sh = size
+        interp = cv2.INTER_AREA if h > sh or w > sw else cv2.INTER_CUBIC
+        aspect = w / h
+        if aspect > sw / sh:
+            new_w = sw
+            new_h = np.round(new_w / aspect).astype(int)
+            pad_vert = (sh - new_h) / 2
+            pad_top, pad_bot = np.floor(pad_vert).astype(int), np.ceil(pad_vert).astype(int)
+            pad_left, pad_right = 0, 0
+        else:
+            new_h = sh
+            new_w = np.round(new_h * aspect).astype(int)
+            pad_horz = (sw - new_w) / 2
+            pad_left, pad_right = np.floor(pad_horz).astype(int), np.ceil(pad_horz).astype(int)
+            pad_top, pad_bot = 0, 0
+        scaled_img = cv2.resize(img, (new_w, new_h), interpolation=interp)
+        padded_img = cv2.copyMakeBorder(scaled_img, pad_top, pad_bot, pad_left, pad_right, borderType=cv2.BORDER_CONSTANT, value=[pad_color]*3)
+        return padded_img '''
+
     def video_loop(self):
         while self.is_running:
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-            
-            frame = cv2.flip(frame, 1)
+            try:
+                ret, frame = self.cap.read()
+                if not ret:
+                    time.sleep(0.1)
+                    continue
+                
+                frame = cv2.flip(frame, 1)
+                #
+                # frame = self.resize_and_pad(frame, (self.window_width, self.window_height))
 
-            # call the analyzer to do all the heavy lifting
-            processed_frame = self.analyzer.process_frame(frame, self.target_form)
+                self.frame_counter += 1
+                processed_frame = frame.copy() 
 
-            # put the final, annotated frame in the queue
-            if self.queue.full():
-                try: self.queue.get_nowait()
-                except queue.Empty: pass
+                if self.frame_counter % self.processing_interval == 0:
+                    _, analysis_results, tracked_persons = self.analyzer.process_frame(frame)
+                    self.last_known_results = analysis_results
+                    self.last_known_tracked_persons = tracked_persons
+                else:
+                    analysis_results = self.last_known_results
+                    tracked_persons = self.last_known_tracked_persons
+
+                for person in tracked_persons:
+                    x1, y1, x2, y2, person_id = map(int, person)
+                    cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (255, 0, 255), 3)
+                    cv2.putText(processed_frame, f"User {person_id}", (x1, y1 - 10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
+
+                for result in analysis_results:
+                    person_id = result['id']
+                    predicted_class = result['predicted_class']
+                    confidence = result['confidence']
+                    live_angles = result['live_angles']
+                    x1, y1, x2, y2 = result['bbox']
+                    
+                    if self.target_form:
+                        if predicted_class == self.target_form and confidence > 0.60:
+                            ideal_pose = POSE_LIBRARY.get(self.target_form)
+                            error_messages = []
+                            is_correct = True
+                            if ideal_pose and live_angles:
+                                for joint, ideal_range in ideal_pose.items():
+                                    live_angle = live_angles.get(joint)
+                                    if live_angle is not None:
+                                        min_angle, max_angle = ideal_range
+                                        if not (min_angle <= live_angle <= max_angle):
+                                            is_correct = False
+                                            error_messages.append(f"{joint.replace('_', ' ')} {'bent' if live_angle < min_angle else 'straight'}")
+                            
+                            if is_correct:
+                                cv2.putText(processed_frame, "Correct!", (x1, y2 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                            else:
+                                for i, msg in enumerate(error_messages[:2]):
+                                    cv2.putText(processed_frame, msg, (x1, y2 + 30 + (i * 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        else:
+                            pretty_form_name = self.form_button.cget('text')
+                            if pretty_form_name != "Choose Arnis Form":
+                                cv2.putText(processed_frame, f"Adjust to {pretty_form_name}", (x1, y2 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+                if self.queue.full():
+                    try: self.queue.get_nowait()
+                    except queue.Empty: pass
+                
+                self.queue.put(processed_frame)
             
-            self.queue.put(processed_frame)
+            except Exception as e:
+                print(f"[critical error in video_loop]: {e}")
+                time.sleep(0.5)
 
     def process_queue(self):
         try:
@@ -143,13 +211,12 @@ class TuroArnisGUI:
     def on_closing(self):
         print("closing application...")
         self.is_running = False
-        time.sleep(0.5) # give the thread time to finish its current loop
-        self.analyzer.close()
-        self.cap.release()
+        time.sleep(0.5)
+        if hasattr(self, 'analyzer'): self.analyzer.close()
+        if hasattr(self, 'cap') and self.cap.isOpened(): self.cap.release()
         self.window.destroy()
         
     def on_user_selected(self, username):
-        # this is now less critical but can be used for logging
         self.current_user = username
         self.user_button.config(text=username)
         print(f"current user set to: {username}")
